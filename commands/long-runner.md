@@ -2,10 +2,17 @@
 
 长时间运行 Agent 的自动化框架，基于 Anthropic 官方最佳实践。
 
-**v4.0: Browser-First Testing + Defense-in-Depth Security + Error Recovery**
+**v5.1: Browser-First Testing + Defense-in-Depth Security + Error Recovery + Meta-Harness Trace Store + Dual-Agent Debate**
 
 > 参考来源: [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
 > 代码库: [claude-quickstarts/autonomous-coding](https://github.com/anthropics/claude-quickstarts/tree/main/autonomous-coding)
+
+> v5.0 新增（基于 Meta-Harness 论文 arxiv:2603.28052v1）:
+> - **Trace Store**: 完整 session trace 存文件系统，agent 自己 grep/cat 查询，不压缩
+> - **环境 Bootstrap**: 自动探测项目环境，消除每轮 2-3 次探索浪费
+> - **因果假设**: 调试时显式写因果链，跨 session 学习
+> - **Pareto 追踪**: 多维 metric 追踪，不只单一 pass/fail
+> - **v5.1 新增**: **双 Agent 辩论** — init 阶段并行启动提案者 + 评审者，提升技术方案和 feature_list 质量
 
 ---
 
@@ -20,6 +27,7 @@
 | 功能标记过早 | 设定 feature_list 规则 | 必须通过浏览器 UI 自动化验证后才可标记 |
 | 环境启动困难 | 编写 init.sh 标准化启动 | 启动时运行 init.sh |
 | 上下文过长导致遗忘 | 设定 session 隔离架构 | 每个功能在独立 session 执行 |
+| 方案/需求质量不足 | **双 Agent 辩论：提案者 + 评审者** | 读取经过辩论审查的 feature_list |
 
 ---
 
@@ -33,6 +41,8 @@
 /long-runner status             # 查看进度
 /long-runner test <feature_id>  # 测试特定功能
 /long-runner resume             # 从中断处恢复
+/long-runner diagnose           # 显示 trace 分析 + 未解决的假设
+/long-runner pareto             # 显示 Pareto 前沿可视化
 ```
 
 ### 自动模式说明
@@ -55,7 +65,22 @@ project/
 ├── app_spec.txt           # 项目规格说明
 ├── .claude_settings.json  # 自动化权限配置
 ├── evidence/              # 浏览器测试截图证据
-└── docs/plans/            # 实现计划
+├── docs/plans/            # 实现计划
+└── .long-runner/              # v2 Trace Store
+    ├── meta.json              # 版本 + 元信息
+    ├── bootstrap/
+    │   └── env-snapshot.json  # 自动生成的环境快照
+    ├── traces/
+    │   ├── index.json         # trace 索引
+    │   └── {session_id}.trace.json
+    ├── hypotheses/
+    │   ├── {session_id}.hypothesis.json
+    │   └── open.md            # 当前未解决的假设
+    ├── pareto/
+    │   ├── metrics.json       # 多维 metric
+    │   └── frontier.json      # Pareto 前沿
+    └── summaries/
+        └── {session_id}.summary.md
 ```
 
 ---
@@ -152,6 +177,48 @@ mkdir -p project/{evidence,docs/plans}
 touch project/{feature_list.json,init.sh,claude-progress.txt,app_spec.txt}
 ```
 
+**STEP 2.5: 初始化 Trace Store**
+
+```bash
+mkdir -p .long-runner/{bootstrap,traces,hypotheses,pareto,summaries}
+```
+
+写入以下初始文件（用 Write 工具）：
+
+- `.long-runner/meta.json`:
+```json
+{"version": 2, "created_at": "ISO-8601", "schema_version": 2}
+```
+（将 ISO-8601 替换为当前时间戳）
+
+- `.long-runner/traces/index.json`:
+```json
+[]
+```
+
+- `.long-runner/hypotheses/open.md`:
+```markdown
+# Open Hypotheses
+(No open hypotheses yet)
+```
+
+- `.long-runner/pareto/metrics.json`:
+```json
+{
+  "dimensions": [
+    {"name": "functional", "description": "功能测试通过数", "unit": "count"},
+    {"name": "visual_quality", "description": "UI 视觉质量评分", "unit": "score"},
+    {"name": "console_errors", "description": "浏览器控制台错误数", "unit": "count", "lower_is_better": true}
+  ],
+  "history": []
+}
+```
+
+- `.long-runner/pareto/frontier.json`:
+```json
+{"snapshots": []}
+```
+
 **STEP 3: 创建 app_spec.txt**
 
 根据用户描述，生成详细的项目规格说明，包括：
@@ -161,7 +228,119 @@ touch project/{feature_list.json,init.sh,claude-progress.txt,app_spec.txt}
 - 数据模型
 - UI/UX 规范
 
-**STEP 4: 创建 feature_list.json（关键！）**
+**STEP 3.5: 双 Agent 辩论（技术方案 + Feature List 审查）**
+
+基于 app_spec.txt，启动两个并行的 Agent 进行辩论式协作。**这是提升 feature_list 质量的关键步骤，不得跳过。**
+
+**Agent A（提案者 / Proposer）**：
+
+**必须先调用 superpowers:brainstorm skill 进行技术方案头脑风暴，再生成 feature_list。**
+
+如果 brainstorm skill 可用，Agent A 的执行流程为：
+1. 调用 `superpowers:brainstorm` skill，输入项目描述 + app_spec.txt 内容
+2. 从 brainstorm 输出中提炼技术方案（选择技术栈、说明理由、列出替代方案）
+3. 基于头脑风暴结果生成 feature_list.json
+
+如果 brainstorm skill 不可用，回退到直接生成。
+
+Agent A 的 Prompt 要点：
+```
+你是一个全栈架构师。基于以下 app_spec.txt，完成两项任务：
+
+1. 先调用 superpowers:brainstorm skill，对项目进行技术方案头脑风暴
+   - 将 app_spec.txt 的完整内容作为 brainstorm 的输入
+   - 从 brainstorm 结果中提炼最终技术方案
+   - 选择技术栈，说明理由，列出替代方案及为什么没选
+
+2. 基于头脑风暴结果，生成完整 feature_list.json：至少 50 个功能测试
+
+要求：
+- 扁平 JSON 数组格式
+- 包含 functional 和 style 两类
+- 混合简短测试（2-5步）和综合测试（10+步），至少 25% 需要 10+ 步
+- 每个功能的 depends_on 必须准确反映真实依赖
+- 按优先级排序：基础功能优先
+- 所有 passes=false
+
+输出格式：
+## 技术方案（基于 brainstorm）
+[方案描述]
+
+## feature_list.json
+[完整 JSON]
+```
+
+将 app_spec.txt 的完整内容附在 prompt 末尾。
+
+**Agent B（评审者 / Critic）**：
+
+Prompt 要点：
+```
+你是一个资深技术评审专家。你的职责是挑战和改进技术方案。
+
+你将收到一份 app_spec.txt 和一份技术方案 + feature_list 的初稿。
+请从以下角度进行严格审查：
+
+1. 技术方案审查：
+   - 是否过度设计？有没有更简单的方案？
+   - 是否考虑了性能、安全、可维护性？
+   - 依赖关系是否合理？
+
+2. feature_list 审查（重点！）：
+   - 有没有遗漏的关键功能？（用户认证的边界情况、错误处理、加载状态等）
+   - 步骤是否足够具体可执行？（"验证页面正常" 不合格，必须写明验证什么）
+   - depends_on 依赖关系是否正确？（有没有循环依赖或遗漏？）
+   - 优先级排序是否合理？
+   - 边界情况和错误路径有没有覆盖？
+
+3. 补充建议：
+   - 列出你认为缺失的 feature，按优先级排列
+   - 列出你认为步骤不够清晰的 feature，给出改进建议
+   - 列出你认为依赖关系有问题的 feature
+
+输出格式：
+## 技术方案评审
+[评审意见]
+
+## Feature List 评审
+### 遗漏的功能
+[列表]
+
+### 步骤不够清晰的 Feature
+[列表]
+
+### 依赖关系问题
+[列表]
+
+## 建议新增的 Feature
+[完整 JSON 数组，包含 id（从当前最大 id+1 开始）、category、priority、description、depends_on、steps、passes=false]
+```
+
+将 app_spec.txt + Agent A 的完整输出附在 prompt 末尾。
+
+**执行方式**：
+
+使用 Agent 工具并行启动 A 和 B：
+
+```
+Agent A: "proposer" - General-Purpose 类型，传入 app_spec.txt
+Agent B: "critic"   - General-Purpose 类型，传入 app_spec.txt
+```
+
+**如果项目较小（用户描述明显是简单应用）**，可以串行执行：先 A 后 B。
+
+**STEP 4: 综合辩论结果，生成最终 feature_list.json**
+
+收到两个 Agent 的输出后，主线程负责综合：
+
+1. 读取 Agent A 的技术方案和 feature_list 初稿
+2. 读取 Agent B 的评审意见和补充建议
+3. 综合决策：
+   - 技术方案：采纳合理的质疑，保留有充分理由的选择
+   - feature_list：合并 A 的初稿 + B 建议新增的 feature（去重）
+   - 对 B 指出"步骤不够清晰"的 feature，补充完善步骤
+   - 对 B 指出"依赖关系问题"的 feature，修正 depends_on
+4. 写入最终 feature_list.json
 
 **格式：扁平 JSON 数组（不要用 object 包裹）**
 
@@ -183,13 +362,14 @@ touch project/{feature_list.json,init.sh,claude-progress.txt,app_spec.txt}
 ]
 ```
 
-**要求：**
+**最终 feature_list 要求：**
 - 最少 50 个功能测试（复杂项目 200+）
 - 包含 "functional" 和 "style" 两类
 - 混合简短测试（2-5步）和综合测试（10+步）
 - 至少 25% 的测试需要有 10+ 步
 - 按优先级排序：基础功能优先
 - **所有测试初始 passes=false**
+- 已经过 Agent B 审查，覆盖边界情况和错误路径
 
 **CATASTROPHIC INSTRUCTION: IT IS UNACCEPTABLE TO REMOVE OR EDIT FEATURES IN FUTURE SESSIONS.** Features can ONLY be marked as passing (change `"passes": false` to `"passes": true`). Never remove features, never edit descriptions, never modify testing steps. This ensures no functionality is missed.
 
@@ -250,7 +430,24 @@ git commit -m "chore: initialize long-runner harness
 - Next: F001 - [description]
 ```
 
-**STEP 9: （可选）开始实现**
+**STEP 8.5: 生成环境 Bootstrap**
+
+Initializer agent 需要探测项目环境并写入 `.long-runner/bootstrap/env-snapshot.json`，包含：
+
+```json
+{
+  "os": "检测到的操作系统",
+  "package_manager": "npm / pip / cargo / 其他",
+  "language_version": "Node.js / Python 版本",
+  "framework": "检测到的框架（如有）",
+  "dev_command": "启动开发服务器的命令",
+  "port": 3000,
+  "database": "检测到的数据库（如有）",
+  "generated_at": "ISO-8601 时间戳"
+}
+```
+
+探测方式：检查 `package.json`、`requirements.txt`、`Cargo.toml`、`go.mod` 等文件，运行 `node --version`、`python3 --version` 等命令收集信息。
 
 如果 session 还有余量，可以开始实现最高优先级的功能。记住：一次只做一个功能。
 
@@ -263,29 +460,39 @@ git commit -m "chore: initialize long-runner harness
 **STEP 1: 获取上下文（MANDATORY - 必须最先执行）**
 
 ```bash
-# 1. 确认工作目录
-pwd
+# 如果 trace store 存在，读环境快照（1 条命令替代原来的 7 条）
+if [ -f .long-runner/bootstrap/env-snapshot.json ]; then
+    cat .long-runner/bootstrap/env-snapshot.json
+else
+    # 回退到 v1 探索
+    pwd && ls -la && cat app_spec.txt && cat feature_list.json | head -50
+fi
+```
 
-# 2. 查看项目结构
-ls -la
-
-# 3. 读取项目规格，了解在构建什么
-cat app_spec.txt
-
-# 4. 读取功能列表，了解所有工作
-cat feature_list.json | head -50
-
-# 5. 读取之前 session 的进度
+无论哪种路径，仍需读取以下文件获取完整上下文：
+```bash
 cat claude-progress.txt
-
-# 6. 查看最近的 git 提交
 git log --oneline -20
-
-# 7. 统计剩余工作量
 cat feature_list.json | grep '"passes": false' | wc -l
 ```
 
 **理解 app_spec.txt 是关键** - 它包含了应用的完整需求。
+
+**STEP 1.5: 读取历史 Trace（v2 新增）**
+
+```bash
+# 读取最近 3 个 session 的结构化摘要
+ls .long-runner/summaries/ 2>/dev/null | tail -3
+# 对每个 summary，cat 其内容
+
+# 读取未解决的因果假设
+cat .long-runner/hypotheses/open.md
+
+# 读取最近 5 个 session 的 carry_forward 教训
+for f in $(ls -t .long-runner/hypotheses/*.hypothesis.json 2>/dev/null | head -5); do
+  python3 -c "import json; [print(l) for l in json.load(open('$f')).get('carry_forward',[])]"
+done
+```
 
 **STEP 2: 启动环境**
 
@@ -336,26 +543,32 @@ chmod +x init.sh
 3. 修复发现的任何问题
 4. 验证功能端到端可用
 
+**STEP 5.5: 写因果假设（v2 新增）**
+
+当 agent 遇到 bug 并尝试修复时，必须写因果假设。格式如下，追加到 `.long-runner/hypotheses/open.md`：
+
+```markdown
+## H{N}: {简短标题}
+- **因果链**: A -> B -> C（具体描述）
+- **证据**: 观察到的现象
+- **修复尝试**: 做了什么
+- **状态**: open / resolved / invalidated
+- **session**: {SESSION_ID}
+```
+
+同时在 `.long-runner/hypotheses/{SESSION_ID}.hypothesis.json` 写入结构化数据：
+
+```json
+{"session_id":"SESSION_ID","feature_id":"F001","hypotheses":[{"id":"H001","causal_chain":"A -> B -> C","evidence":"...","status":"open"}],"carry_forward":["教训1","教训2"]}
+```
+
+当假设被验证或推翻时，更新状态并在 `open.md` 中标记。
+
 **STEP 6: 浏览器 UI 自动化验证（MANDATORY! 这是必须的！）**
 
 **你必须通过真实的浏览器 UI 验证功能。这不是可选的。**
 
-使用 Playwright MCP 工具集，像真实用户一样测试：
-
-```
-mcp__playwright__browser_navigate    - 导航到应用 URL
-mcp__playwright__browser_snapshot    - 获取页面可访问性快照（优先于截图）
-mcp__playwright__browser_click       - 点击元素
-mcp__playwright__browser_type        - 输入文本
-mcp__playwright__browser_fill_form   - 填写表单
-mcp__playwright__browser_select_option - 选择下拉选项
-mcp__playwright__browser_press_key   - 按键操作
-mcp__playwright__browser_hover       - 悬停元素
-mcp__playwright__browser_wait_for    - 等待条件满足
-mcp__playwright__browser_take_screenshot - 截图保存到 evidence/
-mcp__playwright__browser_evaluate    - 执行 JS（仅用于调试，不要用来绕过 UI）
-mcp__playwright__browser_console_messages - 检查浏览器控制台错误
-```
+使用 Playwright MCP 工具集（完整列表见下方 Playwright 章节），像真实用户一样测试：
 
 **必须做：**
 - 在真实浏览器中导航到应用
@@ -388,6 +601,21 @@ mcp__playwright__browser_console_messages - 检查浏览器控制台错误
 
 **只有在浏览器截图验证后才能修改 passes 字段。**
 
+**STEP 7.5: 更新 Pareto Metrics（v2 新增）**
+
+用 python3 从 feature_list.json 计算多维 metric，更新 `.long-runner/pareto/metrics.json`：
+
+```bash
+python3 -c "
+import json
+with open('feature_list.json') as f: features = json.load(f)
+passed = sum(1 for f in features if f.get('passes', False))
+with open('.long-runner/pareto/metrics.json') as f: metrics = json.load(f)
+metrics['history'].append({'timestamp':'ISO-8601','functional':passed,'functional_total':len(features),'visual_quality':0,'console_errors':0})
+with open('.long-runner/pareto/metrics.json','w') as f: json.dump(metrics,f,indent=2)
+"
+```
+
 **STEP 8: Git 提交**
 
 ```bash
@@ -399,6 +627,31 @@ git commit -m "feat: implement [feature name] - verified end-to-end
 - Updated feature_list.json: marked [ID] as passing
 - Screenshots saved in evidence/
 "
+```
+
+**STEP 8.5: 写结构化 Summary（v2 新增）**
+
+将本 session 的结果写入 `.long-runner/summaries/{SESSION_ID}.summary.md`，SESSION_ID 使用 `session_YYYYMMDD_HHMMSS` 格式：
+
+```markdown
+# Session {SESSION_ID}
+
+## 基本信息
+- **Feature**: {feature_id} - {description}
+- **状态**: {completed | failed | partial}
+- **日期**: {ISO-8601}
+
+## 做了什么
+- {关键变更列表}
+
+## 遇到的问题
+- {问题描述，或 "无"}
+
+## 遗留假设
+- {未解决的因果假设，或 "无"}
+
+## 给下一个 session 的建议
+- {carry_forward 教训}
 ```
 
 **STEP 9: 更新进度文件**
@@ -429,6 +682,20 @@ git log --oneline -10
 
 # 恢复到上一个正常状态
 git revert HEAD --no-edit
+```
+
+**STEP 10.5: 写 Session Trace（v2 新增）**
+
+将本 session 的结构化 trace 写入 `.long-runner/traces/{SESSION_ID}.trace.json`：
+
+```json
+{"session_id":"SESSION_ID","feature_id":"F001","timestamp":"ISO-8601","status":"completed | failed | partial","steps_completed":[1,2,3,5,6,7,8],"steps_skipped":[],"regression_issues":[],"browser_screenshots":["evidence/F001_step1.png"],"console_errors":0,"hypotheses_opened":["H001"],"hypotheses_resolved":[],"git_commit":"abc1234","duration_estimate_minutes":5}
+```
+
+然后更新 `.long-runner/traces/index.json`，追加一条索引记录：
+
+```json
+[{"session_id":"SESSION_ID","feature_id":"F001","timestamp":"ISO-8601","status":"completed","has_trace":true}]
 ```
 
 ---
@@ -504,6 +771,62 @@ for f in data:
 
 ---
 
+### 模式: diagnose - 诊断分析
+
+读取 `.long-runner/` 目录，展示项目健康状态：
+
+```bash
+# 1. Trace 概览 + 卡住检测
+cat .long-runner/traces/index.json | python3 -c "
+import json, sys
+from collections import Counter
+index = json.load(sys.stdin)
+failed = [i for i in index if i.get('status') == 'failed']
+partial = [i for i in index if i.get('status') == 'partial']
+print(f'Total: {len(index)} | Failed: {len(failed)} | Partial: {len(partial)}')
+for f in failed:
+    print(f'  FAILED: {f[\"feature_id\"]} ({f[\"timestamp\"][:10]})')
+stuck = Counter(i['feature_id'] for i in index if i.get('status') in ('failed','partial'))
+for fid, cnt in stuck.items():
+    if cnt >= 3: print(f'  WARNING: {fid} stuck ({cnt} attempts)')
+"
+# 2. 未解决的因果假设
+cat .long-runner/hypotheses/open.md
+# 3. Pareto metric 趋势
+cat .long-runner/pareto/metrics.json | python3 -c "
+import json, sys
+h = json.load(sys.stdin).get('history',[])
+if h: s=h[-1]; print(f'Functional: {s[\"functional\"]}/{s[\"functional_total\"]} | Visual: {s.get(\"visual_quality\",\"N/A\")} | Console errors: {s.get(\"console_errors\",\"N/A\")} | Snapshots: {len(h)}')
+"
+```
+
+---
+
+### 模式: pareto - Pareto 前沿可视化
+
+读取 `.long-runner/pareto/` 目录，展示多维 metric 演进：
+
+```bash
+cat .long-runner/pareto/metrics.json | python3 -c "
+import json, sys
+m = json.load(sys.stdin)
+print('=== Dimensions ===')
+for d in m.get('dimensions',[]):
+    dir_ = '(lower is better)' if d.get('lower_is_better') else '(higher is better)'
+    print(f'  {d[\"name\"]}: {d[\"description\"]} {dir_}')
+print('=== History ===')
+for s in m.get('history',[]):
+    ts=s.get('timestamp','?')[:10]; print(f'  {ts} | func={s[\"functional\"]}/{s[\"functional_total\"]} | visual={s.get(\"visual_quality\",\"N/A\")} | err={s.get(\"console_errors\",\"N/A\")}')
+"
+cat .long-runner/pareto/frontier.json | python3 -c "
+import json, sys
+sn = json.load(sys.stdin).get('snapshots',[])
+print('No frontier snapshots.' if not sn else '\n'.join(f'  {s}' for s in sn))
+"
+```
+
+---
+
 ## Playwright MCP 浏览器测试（核心能力）
 
 **这是 long-runner 区别于普通开发流程的关键。每个功能都必须经过真实浏览器 UI 验证。**
@@ -538,23 +861,20 @@ claude mcp add playwright -- npx @playwright/mcp@latest
 
 ### 典型测试流程
 
-```
-1. browser_navigate -> 打开应用 URL
-2. browser_snapshot -> 获取页面结构（用于选择正确的 ref）
-3. browser_click -> 点击目标元素（使用 snapshot 中的 ref）
-4. browser_type -> 输入文本
-5. browser_wait_for -> 等待结果出现
-6. browser_take_screenshot -> 保存截图到 evidence/{feature_id}.png
-7. browser_console_messages -> 检查是否有 JS 错误
-```
+1. `browser_navigate` -> 打开应用 URL
+2. `browser_snapshot` -> 获取页面结构（用 ref 选择元素）
+3. `browser_click` / `browser_type` -> 交互操作
+4. `browser_wait_for` -> 等待结果出现
+5. `browser_take_screenshot` -> 保存到 `evidence/{feature_id}.png`
+6. `browser_console_messages` -> 检查 JS 错误
 
 ### 注意事项
 
-- **使用 snapshot 而不是截图来决定操作**：snapshot 返回可访问性树，包含精确的 element ref
-- **每步操作前先 snapshot**：页面可能因上一步操作而改变
-- **截图用于存证**：保存到 `evidence/` 目录作为验证证据
-- **检查控制台错误**：功能可能"看起来"正常但有 JS 报错
-- **已知限制**：browser-native alert/confirm 弹窗可能无法正确捕获
+- 使用 snapshot（不是截图）来决定操作，它返回精确的 element ref
+- 每步操作前先 snapshot，页面可能已变化
+- 截图用于存证，保存到 `evidence/`
+- 检查控制台错误：功能可能"看起来"正常但有 JS 报错
+- 已知限制：browser-native alert/confirm 弹窗可能无法正确捕获
 
 ---
 
@@ -582,6 +902,8 @@ claude mcp add playwright -- npx @playwright/mcp@latest
 - `status` - 显示进度
 - `test <id>` - 测试指定功能
 - `resume` - 从中断处恢复
+- `diagnose` - 显示 trace 分析 + 未解决的假设
+- `pareto` - 显示 Pareto 前沿可视化
 
 ---
 
