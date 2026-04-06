@@ -2,17 +2,18 @@
 
 长时间运行 Agent 的自动化框架，基于 Anthropic 官方最佳实践。
 
-**v5.1: Browser-First Testing + Defense-in-Depth Security + Error Recovery + Meta-Harness Trace Store + Dual-Agent Debate**
+**v5.2: Browser-First Testing + Defense-in-Depth Security + Error Recovery + Smoke-Test Gate + External Validation**
 
 > 参考来源: [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
 > 代码库: [claude-quickstarts/autonomous-coding](https://github.com/anthropics/claude-quickstarts/tree/main/autonomous-coding)
 
 > v5.0 新增（基于 Meta-Harness 论文 arxiv:2603.28052v1）:
-> - **Trace Store**: 完整 session trace 存文件系统，agent 自己 grep/cat 查询，不压缩
-> - **环境 Bootstrap**: 自动探测项目环境，消除每轮 2-3 次探索浪费
-> - **因果假设**: 调试时显式写因果链，跨 session 学习
-> - **Pareto 追踪**: 多维 metric 追踪，不只单一 pass/fail
-> - **v5.1 新增**: **双 Agent 辩论** — init 阶段并行启动提案者 + 评审者，提升技术方案和 feature_list 质量
+> - **Bootstrap 快照**: 自动探测项目环境，消除每轮 2-3 次探索浪费
+>
+> v5.2 架构优化:
+> - **简化存储**: 去掉 6 类 trace 文件，回归 `claude-progress.txt + git log` 极简模式；保留 `.lr-bootstrap/` 环境快照
+> - **固定冒烟测试**: init 生成 `smoke-test.sh`，每个 session 在 STEP 2.5 强制先跑，确保 app 不被回退破坏
+> - **调度器外部验证**: session exit 0 后验证 passes 是否真的增加，防止"假成功"累积
 
 ---
 
@@ -41,8 +42,6 @@
 /long-runner status             # 查看进度
 /long-runner test <feature_id>  # 测试特定功能
 /long-runner resume             # 从中断处恢复
-/long-runner diagnose           # 显示 trace 分析 + 未解决的假设
-/long-runner pareto             # 显示 Pareto 前沿可视化
 ```
 
 ### 自动模式说明
@@ -61,26 +60,14 @@
 project/
 ├── feature_list.json      # 功能列表（JSON 扁平数组，只允许修改 passes 字段）
 ├── init.sh                # 启动脚本（标准化环境启动）
-├── claude-progress.txt    # 进度日志（每个 session 追加）
+├── smoke-test.sh          # 固定冒烟测试（每个 session 开始前必须通过）
+├── claude-progress.txt    # 进度日志（每个 session 追加，格式见下方）
 ├── app_spec.txt           # 项目规格说明
 ├── .claude_settings.json  # 自动化权限配置
 ├── evidence/              # 浏览器测试截图证据
 ├── docs/plans/            # 实现计划
-└── .long-runner/              # v2 Trace Store
-    ├── meta.json              # 版本 + 元信息
-    ├── bootstrap/
-    │   └── env-snapshot.json  # 自动生成的环境快照
-    ├── traces/
-    │   ├── index.json         # trace 索引
-    │   └── {session_id}.trace.json
-    ├── hypotheses/
-    │   ├── {session_id}.hypothesis.json
-    │   └── open.md            # 当前未解决的假设
-    ├── pareto/
-    │   ├── metrics.json       # 多维 metric
-    │   └── frontier.json      # Pareto 前沿
-    └── summaries/
-        └── {session_id}.summary.md
+└── .lr-bootstrap/
+    └── env-snapshot.json  # 自动生成的环境快照（bootstrap）
 ```
 
 ---
@@ -109,7 +96,7 @@ project/
 | Python | `python`, `python3`, `pip` |
 | 版本控制 | `git` |
 | 进程管理 | `ps`, `lsof`, `sleep`, `pkill`（仅 dev 进程） |
-| 脚本执行 | `./init.sh` |
+| 脚本执行 | `./init.sh`, `./smoke-test.sh` |
 
 **其他所有 bash 命令将被安全 hook 拒绝。**
 
@@ -138,6 +125,7 @@ project/
       "Bash(cargo:*)",
       "Bash(make:*)",
       "Bash(./init.sh)",
+      "Bash(./smoke-test.sh)",
       "Bash(ls:*)",
       "Bash(cat:*)",
       "Bash(head:*)",
@@ -152,6 +140,7 @@ project/
       "Bash(ps:*)",
       "Bash(lsof:*)",
       "Bash(pkill:*)",
+      "Bash(curl:*)",
       "mcp__playwright__*"
     ]
   }
@@ -177,47 +166,13 @@ mkdir -p project/{evidence,docs/plans}
 touch project/{feature_list.json,init.sh,claude-progress.txt,app_spec.txt}
 ```
 
-**STEP 2.5: 初始化 Trace Store**
+**STEP 2.5: 初始化 Bootstrap 快照目录**
 
 ```bash
-mkdir -p .long-runner/{bootstrap,traces,hypotheses,pareto,summaries}
+mkdir -p .lr-bootstrap
 ```
 
-写入以下初始文件（用 Write 工具）：
-
-- `.long-runner/meta.json`:
-```json
-{"version": 2, "created_at": "ISO-8601", "schema_version": 2}
-```
-（将 ISO-8601 替换为当前时间戳）
-
-- `.long-runner/traces/index.json`:
-```json
-[]
-```
-
-- `.long-runner/hypotheses/open.md`:
-```markdown
-# Open Hypotheses
-(No open hypotheses yet)
-```
-
-- `.long-runner/pareto/metrics.json`:
-```json
-{
-  "dimensions": [
-    {"name": "functional", "description": "功能测试通过数", "unit": "count"},
-    {"name": "visual_quality", "description": "UI 视觉质量评分", "unit": "score"},
-    {"name": "console_errors", "description": "浏览器控制台错误数", "unit": "count", "lower_is_better": true}
-  ],
-  "history": []
-}
-```
-
-- `.long-runner/pareto/frontier.json`:
-```json
-{"snapshots": []}
-```
+（环境快照会由调度器自动生成到 `.lr-bootstrap/env-snapshot.json`，init 阶段无需手动填写）
 
 **STEP 3: 创建 app_spec.txt**
 
@@ -399,6 +354,42 @@ curl -s http://localhost:3000 > /dev/null 2>&1 && echo "Service is running at ht
 echo "Environment ready!"
 ```
 
+**STEP 5.5: 创建 smoke-test.sh**
+
+`smoke-test.sh` 是每个 coding session 开始时的最小化冒烟测试，确保 app 没有被上次 session 破坏。
+
+```bash
+#!/bin/bash
+# smoke-test.sh — 固定冒烟测试
+# 每个 coding session 在 STEP 2.5 运行，确保 app 处于可工作状态
+# 失败时 exit 1，成功时 exit 0，必须在 30 秒内完成
+
+set -e
+echo "Running smoke test..."
+
+# 1. 检查服务进程是否运行（根据项目实际情况调整）
+# if ! pgrep -f "node\|npm\|python" > /dev/null 2>&1; then
+#   echo "FAIL: No dev server process found."
+#   exit 1
+# fi
+
+# 2. 检查应用主页可访问（根据实际端口调整）
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 2>/dev/null || echo "000")
+if [ "$HTTP_STATUS" != "200" ]; then
+  echo "FAIL: App not responding (HTTP $HTTP_STATUS). Expected 200."
+  exit 1
+fi
+
+echo "Smoke test PASSED (HTTP $HTTP_STATUS)"
+exit 0
+```
+
+**要求**：
+- 必须在 30 秒内完成
+- 失败时 `exit 1`，成功时 `exit 0`
+- 输出要清晰（PASS/FAIL + 原因）
+- 根据项目实际情况调整检测逻辑
+
 **STEP 6: 创建 .claude_settings.json**
 
 （见上方安全模型配置）
@@ -432,7 +423,7 @@ git commit -m "chore: initialize long-runner harness
 
 **STEP 8.5: 生成环境 Bootstrap**
 
-Initializer agent 需要探测项目环境并写入 `.long-runner/bootstrap/env-snapshot.json`，包含：
+Initializer agent 需要探测项目环境并写入 `.lr-bootstrap/env-snapshot.json`，包含：
 
 ```json
 {
@@ -460,9 +451,9 @@ Initializer agent 需要探测项目环境并写入 `.long-runner/bootstrap/env-
 **STEP 1: 获取上下文（MANDATORY - 必须最先执行）**
 
 ```bash
-# 如果 trace store 存在，读环境快照（1 条命令替代原来的 7 条）
-if [ -f .long-runner/bootstrap/env-snapshot.json ]; then
-    cat .long-runner/bootstrap/env-snapshot.json
+# 如果 bootstrap 存在，读环境快照（1 条命令替代原来的 7 条）
+if [ -f .lr-bootstrap/env-snapshot.json ]; then
+    cat .lr-bootstrap/env-snapshot.json
 else
     # 回退到 v1 探索
     pwd && ls -la && cat app_spec.txt && cat feature_list.json | head -50
@@ -478,22 +469,6 @@ cat feature_list.json | grep '"passes": false' | wc -l
 
 **理解 app_spec.txt 是关键** - 它包含了应用的完整需求。
 
-**STEP 1.5: 读取历史 Trace（v2 新增）**
-
-```bash
-# 读取最近 3 个 session 的结构化摘要
-ls .long-runner/summaries/ 2>/dev/null | tail -3
-# 对每个 summary，cat 其内容
-
-# 读取未解决的因果假设
-cat .long-runner/hypotheses/open.md
-
-# 读取最近 5 个 session 的 carry_forward 教训
-for f in $(ls -t .long-runner/hypotheses/*.hypothesis.json 2>/dev/null | head -5); do
-  python3 -c "import json; [print(l) for l in json.load(open('$f')).get('carry_forward',[])]"
-done
-```
-
 **STEP 2: 启动环境**
 
 ```bash
@@ -502,6 +477,26 @@ chmod +x init.sh
 ```
 
 如果 init.sh 不存在，手动启动服务并记录过程。
+
+**STEP 2.5: 冒烟测试门控（MANDATORY GATE）**
+
+在做任何新功能之前，运行固定冒烟测试：
+
+```bash
+if [ -f smoke-test.sh ]; then
+  chmod +x smoke-test.sh
+  ./smoke-test.sh
+  if [ $? -ne 0 ]; then
+    echo "SMOKE TEST FAILED: App is broken. Fix before implementing new features."
+    # Find what broke it using git log and fix it
+  fi
+fi
+```
+
+**如果冒烟测试失败**，说明上个 session 破坏了 app：
+1. 用 `git log --oneline -5` 找到可能的罪魁祸首
+2. 修复问题，确保冒烟测试通过
+3. 再开始新功能
 
 **STEP 3: 回归验证测试（CRITICAL! 必须在新功能之前执行！）**
 
@@ -543,27 +538,6 @@ chmod +x init.sh
 3. 修复发现的任何问题
 4. 验证功能端到端可用
 
-**STEP 5.5: 写因果假设（v2 新增）**
-
-当 agent 遇到 bug 并尝试修复时，必须写因果假设。格式如下，追加到 `.long-runner/hypotheses/open.md`：
-
-```markdown
-## H{N}: {简短标题}
-- **因果链**: A -> B -> C（具体描述）
-- **证据**: 观察到的现象
-- **修复尝试**: 做了什么
-- **状态**: open / resolved / invalidated
-- **session**: {SESSION_ID}
-```
-
-同时在 `.long-runner/hypotheses/{SESSION_ID}.hypothesis.json` 写入结构化数据：
-
-```json
-{"session_id":"SESSION_ID","feature_id":"F001","hypotheses":[{"id":"H001","causal_chain":"A -> B -> C","evidence":"...","status":"open"}],"carry_forward":["教训1","教训2"]}
-```
-
-当假设被验证或推翻时，更新状态并在 `open.md` 中标记。
-
 **STEP 6: 浏览器 UI 自动化验证（MANDATORY! 这是必须的！）**
 
 **你必须通过真实的浏览器 UI 验证功能。这不是可选的。**
@@ -601,21 +575,6 @@ chmod +x init.sh
 
 **只有在浏览器截图验证后才能修改 passes 字段。**
 
-**STEP 7.5: 更新 Pareto Metrics（v2 新增）**
-
-用 python3 从 feature_list.json 计算多维 metric，更新 `.long-runner/pareto/metrics.json`：
-
-```bash
-python3 -c "
-import json
-with open('feature_list.json') as f: features = json.load(f)
-passed = sum(1 for f in features if f.get('passes', False))
-with open('.long-runner/pareto/metrics.json') as f: metrics = json.load(f)
-metrics['history'].append({'timestamp':'ISO-8601','functional':passed,'functional_total':len(features),'visual_quality':0,'console_errors':0})
-with open('.long-runner/pareto/metrics.json','w') as f: json.dump(metrics,f,indent=2)
-"
-```
-
 **STEP 8: Git 提交**
 
 ```bash
@@ -629,40 +588,20 @@ git commit -m "feat: implement [feature name] - verified end-to-end
 "
 ```
 
-**STEP 8.5: 写结构化 Summary（v2 新增）**
+**STEP 9: 更新进度文件（claude-progress.txt）**
 
-将本 session 的结果写入 `.long-runner/summaries/{SESSION_ID}.summary.md`，SESSION_ID 使用 `session_YYYYMMDD_HHMMSS` 格式：
-
-```markdown
-# Session {SESSION_ID}
-
-## 基本信息
-- **Feature**: {feature_id} - {description}
-- **状态**: {completed | failed | partial}
-- **日期**: {ISO-8601}
-
-## 做了什么
-- {关键变更列表}
-
-## 遇到的问题
-- {问题描述，或 "无"}
-
-## 遗留假设
-- {未解决的因果假设，或 "无"}
-
-## 给下一个 session 的建议
-- {carry_forward 教训}
-```
-
-**STEP 9: 更新进度文件**
+追加一条结构化记录：
 
 ```
-## Session N - [date] (Coding Agent)
-- Completed: F001 - [功能名]
-- Regression test: verified F00X and F00Y still working
-- Issues found and fixed: [list any]
-- Tests passing: X/Y (Z%)
-- Next priority: F002 - [description]
+## Session N — YYYY-MM-DD — Feature F001
+- Status: completed | failed | partial
+- Changes: src/auth.ts, app/login/page.tsx
+- Regression: F002 ✅, F003 ✅
+- Smoke-test: ✅
+- Issues: none
+- Hypothesis: {因果分析（如果调试过），或 "none"}
+- Metrics: 12/50 features
+- Next: F002 — 用户注册表单验证
 ```
 
 **STEP 10: 确保 Session 结束干净**
@@ -682,20 +621,6 @@ git log --oneline -10
 
 # 恢复到上一个正常状态
 git revert HEAD --no-edit
-```
-
-**STEP 10.5: 写 Session Trace（v2 新增）**
-
-将本 session 的结构化 trace 写入 `.long-runner/traces/{SESSION_ID}.trace.json`：
-
-```json
-{"session_id":"SESSION_ID","feature_id":"F001","timestamp":"ISO-8601","status":"completed | failed | partial","steps_completed":[1,2,3,5,6,7,8],"steps_skipped":[],"regression_issues":[],"browser_screenshots":["evidence/F001_step1.png"],"console_errors":0,"hypotheses_opened":["H001"],"hypotheses_resolved":[],"git_commit":"abc1234","duration_estimate_minutes":5}
-```
-
-然后更新 `.long-runner/traces/index.json`，追加一条索引记录：
-
-```json
-[{"session_id":"SESSION_ID","feature_id":"F001","timestamp":"ISO-8601","status":"completed","has_trace":true}]
 ```
 
 ---
@@ -720,6 +645,12 @@ git revert HEAD --no-edit
 - 全新 context window，避免上下文过长
 - 失败隔离，一个功能失败不影响其他
 - 可恢复，中断后 `Ctrl+C` 后再次运行同样的命令即可继续
+
+**调度器外部验证层（v5.2 新增）：**
+调度器在每个 session 完成后，**独立验证** feature_list.json 中 passes 数量是否实际增加：
+- 若增加 → session 计为成功，进入下一个 feature
+- 若未增加（假成功）→ 计入失败次数，重试该 feature
+- 确保即使 `claude` exit 0 但 Agent 没有实际完成任何功能的情况也会被捕获
 
 **终止条件：**
 1. **全部完成** - 所有功能 passes=true
@@ -768,62 +699,6 @@ for f in data:
 2. 检查 feature_list.json 确认未完成功能
 3. 检查 git 状态确保代码干净
 4. 继续执行 auto 模式
-
----
-
-### 模式: diagnose - 诊断分析
-
-读取 `.long-runner/` 目录，展示项目健康状态：
-
-```bash
-# 1. Trace 概览 + 卡住检测
-cat .long-runner/traces/index.json | python3 -c "
-import json, sys
-from collections import Counter
-index = json.load(sys.stdin)
-failed = [i for i in index if i.get('status') == 'failed']
-partial = [i for i in index if i.get('status') == 'partial']
-print(f'Total: {len(index)} | Failed: {len(failed)} | Partial: {len(partial)}')
-for f in failed:
-    print(f'  FAILED: {f[\"feature_id\"]} ({f[\"timestamp\"][:10]})')
-stuck = Counter(i['feature_id'] for i in index if i.get('status') in ('failed','partial'))
-for fid, cnt in stuck.items():
-    if cnt >= 3: print(f'  WARNING: {fid} stuck ({cnt} attempts)')
-"
-# 2. 未解决的因果假设
-cat .long-runner/hypotheses/open.md
-# 3. Pareto metric 趋势
-cat .long-runner/pareto/metrics.json | python3 -c "
-import json, sys
-h = json.load(sys.stdin).get('history',[])
-if h: s=h[-1]; print(f'Functional: {s[\"functional\"]}/{s[\"functional_total\"]} | Visual: {s.get(\"visual_quality\",\"N/A\")} | Console errors: {s.get(\"console_errors\",\"N/A\")} | Snapshots: {len(h)}')
-"
-```
-
----
-
-### 模式: pareto - Pareto 前沿可视化
-
-读取 `.long-runner/pareto/` 目录，展示多维 metric 演进：
-
-```bash
-cat .long-runner/pareto/metrics.json | python3 -c "
-import json, sys
-m = json.load(sys.stdin)
-print('=== Dimensions ===')
-for d in m.get('dimensions',[]):
-    dir_ = '(lower is better)' if d.get('lower_is_better') else '(higher is better)'
-    print(f'  {d[\"name\"]}: {d[\"description\"]} {dir_}')
-print('=== History ===')
-for s in m.get('history',[]):
-    ts=s.get('timestamp','?')[:10]; print(f'  {ts} | func={s[\"functional\"]}/{s[\"functional_total\"]} | visual={s.get(\"visual_quality\",\"N/A\")} | err={s.get(\"console_errors\",\"N/A\")}')
-"
-cat .long-runner/pareto/frontier.json | python3 -c "
-import json, sys
-sn = json.load(sys.stdin).get('snapshots',[])
-print('No frontier snapshots.' if not sn else '\n'.join(f'  {s}' for s in sn))
-"
-```
 
 ---
 
@@ -902,8 +777,6 @@ claude mcp add playwright -- npx @playwright/mcp@latest
 - `status` - 显示进度
 - `test <id>` - 测试指定功能
 - `resume` - 从中断处恢复
-- `diagnose` - 显示 trace 分析 + 未解决的假设
-- `pareto` - 显示 Pareto 前沿可视化
 
 ---
 
