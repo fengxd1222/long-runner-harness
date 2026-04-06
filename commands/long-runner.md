@@ -2,7 +2,7 @@
 
 长时间运行 Agent 的自动化框架，基于 Anthropic 官方最佳实践。
 
-**v5.2: Browser-First Testing + Defense-in-Depth Security + Error Recovery + Smoke-Test Gate + External Validation**
+**v5.3: Browser-First Testing + Defense-in-Depth Security + Error Recovery + Smoke-Test Gate + External Validation + No-Subagent Init**
 
 > 参考来源: [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
 > 代码库: [claude-quickstarts/autonomous-coding](https://github.com/anthropics/claude-quickstarts/tree/main/autonomous-coding)
@@ -14,6 +14,9 @@
 > - **简化存储**: 去掉 6 类 trace 文件，回归 `claude-progress.txt + git log` 极简模式；保留 `.lr-bootstrap/` 环境快照
 > - **固定冒烟测试**: init 生成 `smoke-test.sh`，每个 session 在 STEP 2.5 强制先跑，确保 app 不被回退破坏
 > - **调度器外部验证**: session exit 0 后验证 passes 是否真的增加，防止"假成功"累积
+>
+> v5.3 架构优化:
+> - **移除双 Agent 辩论**: init 改为单 Agent 内联生成 + 自审通道，避免子 Agent 在不稳定 API 环境下卡死；质量通过结构化自检 checklist 保证
 
 ---
 
@@ -28,7 +31,7 @@
 | 功能标记过早 | 设定 feature_list 规则 | 必须通过浏览器 UI 自动化验证后才可标记 |
 | 环境启动困难 | 编写 init.sh 标准化启动 | 启动时运行 init.sh |
 | 上下文过长导致遗忘 | 设定 session 隔离架构 | 每个功能在独立 session 执行 |
-| 方案/需求质量不足 | **双 Agent 辩论：提案者 + 评审者** | 读取经过辩论审查的 feature_list |
+| 方案/需求质量不足 | **结构化自审：生成 → 多维 checklist 检查 → 补全** | 读取经过自审补全的 feature_list |
 
 ---
 
@@ -183,148 +186,137 @@ mkdir -p .lr-bootstrap
 - 数据模型
 - UI/UX 规范
 
-**STEP 3.5: 双 Agent 辩论（技术方案 + Feature List 审查）**
+**STEP 3.5: 技术方案生成 + Feature List 生成（单 Agent 内联完成）**
 
-基于 app_spec.txt，启动两个并行的 Agent 进行辩论式协作。**这是提升 feature_list 质量的关键步骤，不得跳过。**
+⚠️ **不得启动任何子 Agent（Task / Agent 工具）**。整个过程在当前 session 内完成。子 Agent 在某些 API 环境下不可靠，会导致 init 卡死。
 
-**Agent A（提案者 / Proposer）**：
+---
 
-**必须先调用 superpowers:brainstorm skill 进行技术方案头脑风暴，再生成 feature_list。**
+**阶段 1：技术头脑风暴（当前 session 内思考）**
 
-如果 brainstorm skill 可用，Agent A 的执行流程为：
-1. 调用 `superpowers:brainstorm` skill，输入项目描述 + app_spec.txt 内容
-2. 从 brainstorm 输出中提炼技术方案（选择技术栈、说明理由、列出替代方案）
-3. 基于头脑风暴结果生成 feature_list.json
+在你的思考中回答以下问题（不需要输出，只需在决策前思考清楚）：
 
-如果 brainstorm skill 不可用，回退到直接生成。
+1. **技术栈候选**：有哪些选项？各自优劣？
+2. **最终选择与理由**：选了什么？为什么没选其他的？
+3. **核心数据模型**：主要实体有哪些？关系如何？
+4. **API 端点设计**：关键接口有哪些？
+5. **最大技术风险**：哪个部分最可能出问题？预案是什么？
 
-Agent A 的 Prompt 要点：
-```
-你是一个全栈架构师。基于以下 app_spec.txt，完成两项任务：
+如果 `superpowers:brainstorm` skill 可用，可以在此阶段调用它辅助思考。
 
-1. 先调用 superpowers:brainstorm skill，对项目进行技术方案头脑风暴
-   - 将 app_spec.txt 的完整内容作为 brainstorm 的输入
-   - 从 brainstorm 结果中提炼最终技术方案
-   - 选择技术栈，说明理由，列出替代方案及为什么没选
+---
 
-2. 基于头脑风暴结果，生成完整 feature_list.json：至少 50 个功能测试
+**阶段 2：生成 Feature List 初稿**
 
-要求：
-- 扁平 JSON 数组格式
-- 包含 functional 和 style 两类
-- 混合简短测试（2-5步）和综合测试（10+步），至少 25% 需要 10+ 步
-- 每个功能的 depends_on 必须准确反映真实依赖
-- 按优先级排序：基础功能优先
-- 所有 passes=false
+在 `gen_features.py` 中直接生成 20-30 个核心 feature（首批，后续可追加）。
 
-输出格式：
-## 技术方案（基于 brainstorm）
-[方案描述]
+**要求**：
+- 扁平 JSON 数组，包含 `functional` 和 `style` 两类
+- 混合简短测试（2-5 步）和综合测试（8+ 步），至少 25% 需要 8+ 步
+- 每个 feature 的 `depends_on` 准确反映真实依赖
+- 按优先级排序：基础功能 → 核心功能 → 扩展功能
+- 所有 `passes: False`
+- **禁止用 Write 工具写 feature_list.json**（会导致 stdout 卡死），只能通过 Python 脚本写磁盘
 
-## feature_list.json
-[完整 JSON]
-```
+```python
+# gen_features.py
+import json
 
-将 app_spec.txt 的完整内容附在 prompt 末尾。
-
-**Agent B（评审者 / Critic）**：
-
-Prompt 要点：
-```
-你是一个资深技术评审专家。你的职责是挑战和改进技术方案。
-
-你将收到一份 app_spec.txt 和一份技术方案 + feature_list 的初稿。
-请从以下角度进行严格审查：
-
-1. 技术方案审查：
-   - 是否过度设计？有没有更简单的方案？
-   - 是否考虑了性能、安全、可维护性？
-   - 依赖关系是否合理？
-
-2. feature_list 审查（重点！）：
-   - 有没有遗漏的关键功能？（用户认证的边界情况、错误处理、加载状态等）
-   - 步骤是否足够具体可执行？（"验证页面正常" 不合格，必须写明验证什么）
-   - depends_on 依赖关系是否正确？（有没有循环依赖或遗漏？）
-   - 优先级排序是否合理？
-   - 边界情况和错误路径有没有覆盖？
-
-3. 补充建议：
-   - 列出你认为缺失的 feature，按优先级排列
-   - 列出你认为步骤不够清晰的 feature，给出改进建议
-   - 列出你认为依赖关系有问题的 feature
-
-输出格式：
-## 技术方案评审
-[评审意见]
-
-## Feature List 评审
-### 遗漏的功能
-[列表]
-
-### 步骤不够清晰的 Feature
-[列表]
-
-### 依赖关系问题
-[列表]
-
-## 建议新增的 Feature
-[完整 JSON 数组，包含 id（从当前最大 id+1 开始）、category、priority、description、depends_on、steps、passes=false]
-```
-
-将 app_spec.txt + Agent A 的完整输出附在 prompt 末尾。
-
-**执行方式**：
-
-使用 Agent 工具并行启动 A 和 B：
-
-```
-Agent A: "proposer" - General-Purpose 类型，传入 app_spec.txt
-Agent B: "critic"   - General-Purpose 类型，传入 app_spec.txt
-```
-
-**如果项目较小（用户描述明显是简单应用）**，可以串行执行：先 A 后 B。
-
-**STEP 4: 综合辩论结果，生成最终 feature_list.json**
-
-收到两个 Agent 的输出后，主线程负责综合：
-
-1. 读取 Agent A 的技术方案和 feature_list 初稿
-2. 读取 Agent B 的评审意见和补充建议
-3. 综合决策：
-   - 技术方案：采纳合理的质疑，保留有充分理由的选择
-   - feature_list：合并 A 的初稿 + B 建议新增的 feature（去重）
-   - 对 B 指出"步骤不够清晰"的 feature，补充完善步骤
-   - 对 B 指出"依赖关系问题"的 feature，修正 depends_on
-4. 写入最终 feature_list.json
-
-**格式：扁平 JSON 数组（不要用 object 包裹）**
-
-```json
-[
-  {
-    "id": "F001",
-    "category": "functional",
-    "priority": "high",
-    "description": "详细的功能描述和测试验证点",
-    "depends_on": [],
-    "steps": [
-      "Step 1: 导航到页面",
-      "Step 2: 执行操作",
-      "Step 3: 验证结果"
-    ],
-    "passes": false
-  }
+features = [
+    {
+        "id": "F001",
+        "category": "functional",
+        "priority": "high",
+        "description": "详细的功能描述和测试验证点",
+        "depends_on": [],
+        "steps": [
+            "Step 1: 导航到页面",
+            "Step 2: 执行操作",
+            "Step 3: 验证结果（具体说明验证什么）"
+        ],
+        "passes": False
+    },
+    # ... 其他 feature ...
 ]
+
+with open('feature_list.json', 'w') as f:
+    json.dump(features, f, indent=2, ensure_ascii=False)
+print(f"Written {len(features)} features to feature_list.json")
 ```
 
-**最终 feature_list 要求：**
-- 最少 50 个功能测试（复杂项目 200+）
-- 包含 "functional" 和 "style" 两类
-- 混合简短测试（2-5步）和综合测试（10+步）
-- 至少 25% 的测试需要有 10+ 步
-- 按优先级排序：基础功能优先
-- **所有测试初始 passes=false**
-- 已经过 Agent B 审查，覆盖边界情况和错误路径
+执行：
+```bash
+python3 gen_features.py && rm gen_features.py
+```
+
+---
+
+**阶段 3：自审 Checklist（Self-Review Pass）**
+
+初稿写入后，按以下 checklist 逐项检查，发现问题立即修复：
+
+**功能覆盖**
+- [ ] 是否覆盖了所有主要用户流程？（注册/登录/核心操作/退出）
+- [ ] 是否有对应的错误路径？（登录失败、网络超时、权限不足）
+- [ ] 是否有空状态 / 加载状态？（空列表显示、loading spinner）
+
+**步骤质量**
+- [ ] 每个 step 是否具体可执行？（"验证页面正常"不合格，要说明验证什么）
+- [ ] 综合测试（8+ 步）是否覆盖了多个操作的联动？
+- [ ] 步骤中是否包含断言？（"应看到 XXX"、"不应出现 YYY"）
+
+**依赖关系**
+- [ ] 每个 feature 的 `depends_on` 是否准确？（前置功能必须先完成）
+- [ ] 是否存在循环依赖？（A → B → A）
+- [ ] 有没有孤立的 feature 应该依赖别人但没有声明？
+
+**优先级与排序**
+- [ ] 基础功能（用户系统、数据 CRUD）是否排在最前面？
+- [ ] 有没有高优先级 feature 排在了低优先级 feature 后面？
+
+**如果发现问题**，创建新的 `gen_features.py`（追加或覆盖模式）补充遗漏的 feature 或修正问题，然后重新执行。
+
+---
+
+**追加更多 feature（不影响已有 passes 状态）**
+
+```python
+# gen_more_features.py
+import json
+
+new_features = [
+    # ... 新增的 feature ...
+]
+
+with open('feature_list.json') as f:
+    existing = json.load(f)
+
+existing.extend(new_features)
+
+with open('feature_list.json', 'w') as f:
+    json.dump(existing, f, indent=2, ensure_ascii=False)
+print(f"Added {len(new_features)} features, total now {len(existing)}")
+```
+
+**STEP 4: 最终确认 feature_list.json**
+
+自审完成后执行最终验证：
+
+```bash
+python3 -c "
+import json
+d = json.load(open('feature_list.json'))
+print(f'Total features: {len(d)}')
+high = sum(1 for f in d if f.get('priority') == 'high')
+print(f'High priority: {high}')
+no_steps = [f['id'] for f in d if not f.get('steps')]
+if no_steps:
+    print(f'WARNING: No steps: {no_steps}')
+else:
+    print('OK: All features have steps')
+print('feature_list.json is valid')
+"
+```
 
 **CATASTROPHIC INSTRUCTION: IT IS UNACCEPTABLE TO REMOVE OR EDIT FEATURES IN FUTURE SESSIONS.** Features can ONLY be marked as passing (change `"passes": false` to `"passes": true`). Never remove features, never edit descriptions, never modify testing steps. This ensures no functionality is missed.
 
@@ -456,15 +448,28 @@ if [ -f .lr-bootstrap/env-snapshot.json ]; then
     cat .lr-bootstrap/env-snapshot.json
 else
     # 回退到 v1 探索
-    pwd && ls -la && cat app_spec.txt && cat feature_list.json | head -50
+    pwd && ls -la && cat app_spec.txt
 fi
 ```
 
-无论哪种路径，仍需读取以下文件获取完整上下文：
+然后读取进度（精准读取，不要 cat 整个 feature_list.json！大文件会导致输出溢出）：
 ```bash
 cat claude-progress.txt
-git log --oneline -20
-cat feature_list.json | grep '"passes": false' | wc -l
+git log --oneline -10
+# 精准读取：只获取当前 feature 信息 + 进度统计
+python3 -c "
+import json, sys
+with open('feature_list.json') as f: data = json.load(f)
+features = data if isinstance(data, list) else data.get('features', [])
+passed = sum(1 for f in features if f.get('passes'))
+# Print only the next unpassed feature (the one to implement)
+for f in features:
+    if not f.get('passes') and not f.get('skipped'):
+        print(f'Progress: {passed}/{len(features)} passed')
+        print('Next feature:', json.dumps(f, indent=2, ensure_ascii=False))
+        sys.exit(0)
+print(f'All {len(features)} features done!')
+"
 ```
 
 **理解 app_spec.txt 是关键** - 它包含了应用的完整需求。
@@ -558,19 +563,34 @@ fi
 - 跳过视觉验证
 - 未经浏览器截图验证就标记 passes=true
 
-**STEP 7: 更新 feature_list.json（小心操作！）**
+**STEP 7: 更新 feature_list.json（必须用 Python，严禁 Write 工具！）**
 
-**你只能修改一个字段：`passes`**
+⚠️ **绝对禁止用 Write 工具操作 feature_list.json** — Write 工具会把整个大文件写入 stdout，导致 session 卡死。
 
-经过浏览器截图验证后，修改：
-```json
-"passes": false  -->  "passes": true
+必须使用以下 Python 命令，只精准修改 `passes` 字段（将 `TARGET_ID` 替换为实际的 feature ID）：
+
+```bash
+python3 -c "
+import json
+with open('feature_list.json') as f: data = json.load(f)
+features = data if isinstance(data, list) else data.get('features', [])
+updated = False
+for feat in features:
+    if feat['id'] == 'TARGET_ID':
+        feat['passes'] = True
+        updated = True
+        break
+if not updated:
+    print('ERROR: TARGET_ID not found'); exit(1)
+with open('feature_list.json', 'w') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+print('Updated TARGET_ID: passes=true')
+"
 ```
 
 **绝对禁止：**
-- 删除测试
-- 编辑测试描述
-- 修改测试步骤
+- 使用 Write 工具写 feature_list.json（大文件卡死风险）
+- 删除测试、编辑测试描述、修改测试步骤
 - 合并或重排序测试
 
 **只有在浏览器截图验证后才能修改 passes 字段。**
@@ -758,6 +778,7 @@ claude mcp add playwright -- npx @playwright/mcp@latest
 | 规则 | 说明 | 原因 |
 |------|------|------|
 | **禁止删除/修改测试** | 只能添加新测试 | 防止功能缺失或 bug 被掩盖 |
+| **禁止 Write 工具操作 feature_list.json** | 只能用 Bash+Python `json.load/dump` | Write 工具把整个文件输出到 stdout，大文件卡死 |
 | **使用 JSON 而非 Markdown** | feature_list 用 JSON 扁平数组 | 模型更不容易意外修改 JSON |
 | **每次只做一个功能** | 专注单一任务 | 避免 context 耗尽，留下半成品 |
 | **Session 结束必须干净** | 代码可合并、无大 bug | 下一个 agent 能顺利接手 |

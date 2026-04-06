@@ -366,13 +366,22 @@ If .lr-bootstrap/env-snapshot.json exists:
   This file contains everything you need about the project.
 Else fall back to the original exploration commands:
 \`\`\`bash
-pwd
-ls -la
-cat app_spec.txt
-cat feature_list.json | head -50
+pwd && ls -la && cat app_spec.txt
+\`\`\`
+Then read progress and get a compact summary of the feature list
+(DO NOT cat the whole feature_list.json — it floods output on large projects):
+\`\`\`bash
 cat claude-progress.txt
-git log --oneline -20
-cat feature_list.json | grep '\"passes\": false' | wc -l
+git log --oneline -10
+python3 -c \"
+import json
+with open('feature_list.json') as f: data = json.load(f)
+features = data if isinstance(data, list) else data.get('features', [])
+passed = sum(1 for f in features if f.get('passes'))
+print(f'Progress: {passed}/{len(features)} passed')
+target = next((f for f in features if f['id'] == '$feature_id'), None)
+if target: import sys; print(json.dumps(target, indent=2, ensure_ascii=False))
+\"
 \`\`\`
 Understanding app_spec.txt is critical - it contains the full requirements.
 
@@ -429,9 +438,27 @@ DO: Test through real browser UI like a human user. Take screenshots. Check cons
 DON'T: Only test with curl. Use JS evaluate to bypass UI. Skip visual verification.
 
 ## STEP 6: UPDATE feature_list.json
-ONLY change the passes field after browser verification with screenshots:
-\"passes\": false  -->  \"passes\": true
-NEVER remove tests, edit descriptions, or modify steps.
+⚠️  NEVER use the Write tool on feature_list.json — writing a large JSON file via the Write
+    tool floods stdout and HANGS the session. Use this exact Python command instead:
+\`\`\`bash
+python3 -c \"
+import json
+with open('feature_list.json') as f: data = json.load(f)
+features = data if isinstance(data, list) else data.get('features', [])
+updated = False
+for feat in features:
+    if feat['id'] == '$feature_id':
+        feat['passes'] = True
+        updated = True
+        break
+if not updated:
+    print('ERROR: $feature_id not found'); exit(1)
+with open('feature_list.json', 'w') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+print('Updated $feature_id: passes=true')
+\"
+\`\`\`
+NEVER remove tests, edit descriptions, or modify steps. Only the passes field may change.
 
 ## STEP 7: GIT COMMIT
 \`\`\`bash
